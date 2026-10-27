@@ -1,9 +1,6 @@
 #include <Arduino.h>
 #include <TFT_eSPI.h>
-#include <BLEDevice.h>
-#include <BLEServer.h>
-#include <BLEUtils.h>
-#include <BLE2902.h>
+#include <NimBLEDevice.h>
 
 TFT_eSPI tft = TFT_eSPI();
 
@@ -13,6 +10,7 @@ TFT_eSPI tft = TFT_eSPI();
 
 constexpr uint8_t DISPLAY_ROTATION = 1;  // 320 x 170 landscape
 constexpr int SCREEN_MARGIN = 12;
+constexpr int USAGE_BAR_WIDTH = 180;
 
 constexpr int UNKNOWN_VALUE = -1;
 constexpr int MAX_CURSOR_CENTS = 999999;
@@ -29,21 +27,20 @@ int cursorLimitCents = UNKNOWN_VALUE;
 #define SERVICE_UUID        "12345678-1234-1234-1234-123456789abc"
 #define CHARACTERISTIC_UUID "87654321-4321-4321-4321-cba987654321"
 
-BLEServer* bleServer = nullptr;
-BLECharacteristic* usageCharacteristic = nullptr;
+NimBLEServer* bleServer = nullptr;
+NimBLECharacteristic* usageCharacteristic = nullptr;
 
 bool deviceConnected = false;
 
-// Restarting advertising from inside the BLE disconnect callback can race
-// with Bluedroid's connection cleanup.  Defer it to loop() and give the host
-// task a short quiet period first.
+// Restart advertising outside the disconnect callback so the NimBLE host can
+// finish connection cleanup before accepting the next BlueZ connection.
 constexpr uint32_t ADVERTISING_RESTART_DELAY_MS = 750;
-constexpr uint8_t MAX_FAILED_CONNECTIONS = 5;
 
 volatile bool advertisingRestartPending = false;
 volatile uint32_t disconnectedAtMs = 0;
 volatile uint8_t failedConnectionCount = 0;
 volatile bool receivedValidWrite = false;
+volatile uint32_t connectedAtMs = 0;
 
 enum DisplayUpdate : uint8_t {
     DISPLAY_NONE,
@@ -111,6 +108,59 @@ void drawProgressBar(
 }
 
 
+void drawPixelPikachu(int x, int y) {
+    // Derived from the Generation I Pokémon Yellow Pikachu sprite provided
+    // by PokéAPI, reduced to a 24 x 24 five-colour indexed image.
+    // https://github.com/PokeAPI/sprites
+    constexpr int SPRITE_SIZE = 24;
+    static const uint16_t PIKACHU_COLORS[] PROGMEM = {
+        TFT_BLACK, 0x3186, 0xE5E9, 0xFFF3, TFT_WHITE,
+    };
+    // Two 4-bit palette indices are packed into each byte to keep the
+    // 24 x 24 colour sprite compact in flash.
+    static const uint8_t PIKACHU_PIXELS[] PROGMEM = {
+        0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x01, 0x11, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x14, 0x40, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x11, 0x00,
+        0x00, 0x14, 0x41, 0x00, 0x00, 0x00, 0x00, 0x00, 0x21, 0x24, 0x11, 0x00,
+        0x00, 0x13, 0x44, 0x42, 0x44, 0x44, 0x42, 0x44, 0x44, 0x42, 0x20, 0x00,
+        0x00, 0x00, 0x33, 0x44, 0x44, 0x44, 0x44, 0x43, 0x33, 0x10, 0x00, 0x00,
+        0x00, 0x00, 0x24, 0x44, 0x44, 0x44, 0x44, 0x44, 0x32, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x24, 0x14, 0x44, 0x44, 0x41, 0x44, 0x20, 0x00, 0x00, 0x01,
+        0x00, 0x00, 0x41, 0x11, 0x44, 0x44, 0x41, 0x14, 0x40, 0x00, 0x00, 0x31,
+        0x00, 0x00, 0x44, 0x14, 0x44, 0x44, 0x41, 0x44, 0x40, 0x00, 0x01, 0x41,
+        0x00, 0x01, 0x22, 0x44, 0x44, 0x44, 0x44, 0x22, 0x21, 0x00, 0x34, 0x41,
+        0x00, 0x02, 0x24, 0x44, 0x24, 0x24, 0x44, 0x42, 0x42, 0x03, 0x44, 0x41,
+        0x00, 0x00, 0x44, 0x44, 0x44, 0x44, 0x44, 0x44, 0x41, 0x14, 0x44, 0x41,
+        0x00, 0x00, 0x24, 0x44, 0x44, 0x44, 0x44, 0x44, 0x22, 0x44, 0x44, 0x40,
+        0x00, 0x00, 0x44, 0x44, 0x43, 0x34, 0x44, 0x44, 0x44, 0x44, 0x44, 0x00,
+        0x00, 0x00, 0x44, 0x41, 0x44, 0x44, 0x14, 0x44, 0x44, 0x41, 0x44, 0x10,
+        0x00, 0x02, 0x44, 0x44, 0x44, 0x42, 0x44, 0x14, 0x41, 0x14, 0x44, 0x00,
+        0x00, 0x01, 0x42, 0x44, 0x44, 0x41, 0x44, 0x34, 0x41, 0x13, 0x20, 0x00,
+        0x00, 0x01, 0x43, 0x14, 0x44, 0x42, 0x41, 0x44, 0x41, 0x23, 0x00, 0x00,
+        0x00, 0x02, 0x44, 0x44, 0x44, 0x44, 0x44, 0x44, 0x41, 0x22, 0x00, 0x00,
+        0x00, 0x00, 0x44, 0x44, 0x44, 0x44, 0x44, 0x44, 0x41, 0x10, 0x00, 0x00,
+        0x00, 0x00, 0x14, 0x44, 0x44, 0x44, 0x44, 0x44, 0x30, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x02, 0x33, 0x22, 0x22, 0x23, 0x43, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x01, 0x12, 0x00, 0x00, 0x00, 0x11, 0x20, 0x00, 0x00, 0x00,
+    };
+
+    for (int row = 0; row < SPRITE_SIZE; ++row) {
+        for (int column = 0; column < SPRITE_SIZE; ++column) {
+            const int pixel = row * SPRITE_SIZE + column;
+            const uint8_t packed = pgm_read_byte(&PIKACHU_PIXELS[pixel / 2]);
+            const uint8_t colorIndex =
+                pixel % 2 == 0 ? packed >> 4 : packed & 0x0F;
+            tft.drawPixel(
+                x + column,
+                y + row,
+                pgm_read_word(&PIKACHU_COLORS[colorIndex])
+            );
+        }
+    }
+}
+
+
 String formatCursorAmount(int usedCents, int limitCents) {
     if (usedCents < 0 || limitCents <= 0) {
         return "$--/$--";
@@ -132,11 +182,36 @@ String formatCursorAmount(int usedCents, int limitCents) {
 }
 
 
-uint16_t cursorUsageColor(int percent) {
-    if (percent >= 90) {
+String formatCursorRemainingRate(int usedCents, int limitCents) {
+    if (usedCents < 0 || limitCents <= 0) {
+        return "--%";
+    }
+
+    // Keep one decimal place so the display reports the monthly remaining
+    // rate instead of only the rounded whole-percent progress-bar value.
+    const int rateTenths = constrain(
+        static_cast<int>(
+            (static_cast<int64_t>(limitCents - usedCents) * 1000 +
+             limitCents / 2) /
+            limitCents
+        ),
+        0,
+        1000
+    );
+
+    if (rateTenths % 10 == 0) {
+        return String(rateTenths / 10) + "%";
+    }
+
+    return String(rateTenths / 10) + "." + String(rateTenths % 10) + "%";
+}
+
+
+uint16_t cursorRemainingColor(int percent) {
+    if (percent <= 10) {
         return TFT_RED;
     }
-    if (percent >= 70) {
+    if (percent <= 30) {
         return TFT_YELLOW;
     }
     return TFT_GREEN;
@@ -151,9 +226,8 @@ void drawUsageRow(
     uint16_t labelColor,
     uint16_t barColor
 ) {
-    const int screenWidth = tft.width();
     const int barY = y + 22;
-    const int barWidth = screenWidth - SCREEN_MARGIN * 2;
+    const int barWidth = min(USAGE_BAR_WIDTH, tft.width() - SCREEN_MARGIN * 2);
 
     tft.setTextDatum(TL_DATUM);
     tft.setTextSize(2);
@@ -165,7 +239,7 @@ void drawUsageRow(
 
     // Long dollar values still fit by dropping to the small bitmap font.
     tft.setTextSize(value.length() > 14 ? 1 : 2);
-    tft.drawString(value, screenWidth - SCREEN_MARGIN, y);
+    tft.drawString(value, tft.width() - SCREEN_MARGIN, y);
 
     drawProgressBar(
         SCREEN_MARGIN,
@@ -174,6 +248,50 @@ void drawUsageRow(
         14,
         percent < 0 ? 0 : percent,
         barColor
+    );
+}
+
+
+void drawCursorUsageRow(
+    int usedCents,
+    int limitCents,
+    int y,
+    int percent
+) {
+    const int screenWidth = tft.width();
+    const int barY = y + 36;
+    const int barWidth = min(USAGE_BAR_WIDTH, screenWidth - SCREEN_MARGIN * 2);
+
+    tft.setTextDatum(TL_DATUM);
+    tft.setTextSize(2);
+    tft.setTextColor(TFT_MAGENTA, TFT_BLACK);
+    tft.drawString("CURSOR MO", SCREEN_MARGIN, y);
+
+    // Put the monthly rate on its own line so it remains as large as the
+    // Codex percentage, while the dollar estimate stays readable below it.
+    tft.setTextDatum(TR_DATUM);
+    tft.setTextColor(TFT_WHITE, TFT_BLACK);
+    tft.drawString(
+        formatCursorRemainingRate(usedCents, limitCents),
+        screenWidth - SCREEN_MARGIN,
+        y
+    );
+
+    tft.setTextSize(1);
+    tft.setTextColor(TFT_LIGHTGREY, TFT_BLACK);
+    tft.drawString(
+        formatCursorAmount(usedCents, limitCents),
+        screenWidth - SCREEN_MARGIN,
+        y + 19
+    );
+
+    drawProgressBar(
+        SCREEN_MARGIN,
+        barY,
+        barWidth,
+        14,
+        percent < 0 ? 0 : percent,
+        cursorRemainingColor(percent < 0 ? 0 : percent)
     );
 }
 
@@ -188,10 +306,11 @@ void drawDashboard(
     const int screenWidth = tft.width();
     const int screenHeight = tft.height();
     const int footerY = screenHeight - 8;
-    const int cursorPercent =
+    const int cursorRemainingPercent =
         cursorUsed >= 0 && cursorLimit > 0
             ? clampPercent(static_cast<int>(
-                  static_cast<int64_t>(cursorUsed) * 100 / cursorLimit
+                  static_cast<int64_t>(cursorLimit - cursorUsed) * 100 /
+                  cursorLimit
               ))
             : UNKNOWN_VALUE;
 
@@ -215,6 +334,8 @@ void drawDashboard(
     tft.setTextSize(2);
     tft.drawString("AI USAGE", SCREEN_MARGIN, 7);
 
+    drawPixelPikachu(screenWidth - SCREEN_MARGIN - 24, 5);
+
     drawUsageRow(
         "CODEX 7D",
         codexRemaining < 0 ? "--%" : String(clampPercent(codexRemaining)) + "%",
@@ -224,13 +345,11 @@ void drawDashboard(
         TFT_GREEN
     );
 
-    drawUsageRow(
-        "CURSOR MO",
-        formatCursorAmount(cursorUsed, cursorLimit),
+    drawCursorUsageRow(
+        cursorUsed,
+        cursorLimit,
         87,
-        cursorPercent,
-        TFT_MAGENTA,
-        cursorUsageColor(cursorPercent < 0 ? 0 : cursorPercent)
+        cursorRemainingPercent
     );
 
 
@@ -279,15 +398,36 @@ void drawDashboard(
 // BLE Server callbacks
 // ============================================================
 
-class ServerCallbacks : public BLEServerCallbacks {
+class ServerCallbacks : public NimBLEServerCallbacks {
 
-    void onConnect(BLEServer* server) override {
+    void onConnect(
+        NimBLEServer* server,
+        NimBLEConnInfo& connection
+    ) override {
 
         deviceConnected = true;
         advertisingRestartPending = false;
         receivedValidWrite = false;
+        connectedAtMs = millis();
 
-        Serial.println("BLE client connected");
+        Serial.printf(
+            "BLE client connected; interval=%.1fms timeout=%ums latency=%u\n",
+            connection.getConnInterval() * 1.25f,
+            connection.getConnTimeout() * 10,
+            connection.getConnLatency()
+        );
+
+        // BlueZ initially proposed only a 420 ms supervision timeout on the
+        // test machine. Request a relaxed 30-50 ms interval and 6 s timeout
+        // before GATT discovery so brief radio/host scheduling stalls do not
+        // tear down the link.
+        server->updateConnParams(
+            connection.getConnHandle(),
+            24,
+            40,
+            0,
+            600
+        );
         // Do not schedule a redraw here. BlueZ is about to discover GATT
         // services, and even a redraw deferred to loop() can run during that
         // discovery and starve the BLE host task. The successful write will
@@ -295,11 +435,20 @@ class ServerCallbacks : public BLEServerCallbacks {
     }
 
 
-    void onDisconnect(BLEServer* server) override {
+    void onDisconnect(
+        NimBLEServer* server,
+        NimBLEConnInfo& connection,
+        int reason
+    ) override {
 
         deviceConnected = false;
 
-        Serial.println("BLE client disconnected");
+        Serial.printf(
+            "BLE client disconnected after %ums; reason=%d (%s)\n",
+            millis() - connectedAtMs,
+            reason,
+            NimBLEUtils::returnCodeToString(reason)
+        );
         pendingDisplayUpdate = DISPLAY_WAITING;
 
         if (receivedValidWrite) {
@@ -413,9 +562,12 @@ bool parseUsagePayload(
         );
 }
 
-class UsageCallbacks : public BLECharacteristicCallbacks {
+class UsageCallbacks : public NimBLECharacteristicCallbacks {
 
-    void onWrite(BLECharacteristic* characteristic) override {
+    void onWrite(
+        NimBLECharacteristic* characteristic,
+        NimBLEConnInfo& connection
+    ) override {
 
         std::string value =
             characteristic->getValue();
@@ -486,13 +638,23 @@ void setupBLE() {
 
 
     // Device name visible from Ubuntu
-    BLEDevice::init(
+    NimBLEDevice::init(
         "Codex-Usage-Monitor"
     );
 
+    // Keep the initial ATT exchange at the BLE default. The complete usage
+    // payload fits in its 20-byte application payload, and avoiding an MTU
+    // renegotiation makes BlueZ service discovery more reliable.
+    NimBLEDevice::setMTU(23);
+
+    // Use the ESP32-S3's maximum BLE transmit power. Connection supervision
+    // timeouts are link-layer failures, so extra RF margin is more useful than
+    // repeatedly restarting the application.
+    NimBLEDevice::setPower(9);
+
 
     bleServer =
-        BLEDevice::createServer();
+        NimBLEDevice::createServer();
 
 
     bleServer->setCallbacks(
@@ -500,7 +662,7 @@ void setupBLE() {
     );
 
 
-    BLEService* service =
+    NimBLEService* service =
         bleServer->createService(
             SERVICE_UUID
         );
@@ -509,8 +671,8 @@ void setupBLE() {
     usageCharacteristic =
         service->createCharacteristic(
             CHARACTERISTIC_UUID,
-            BLECharacteristic::PROPERTY_WRITE |
-            BLECharacteristic::PROPERTY_READ
+            NIMBLE_PROPERTY::WRITE |
+            NIMBLE_PROPERTY::READ
         );
 
 
@@ -524,11 +686,8 @@ void setupBLE() {
     );
 
 
-    service->start();
-
-
-    BLEAdvertising* advertising =
-        BLEDevice::getAdvertising();
+    NimBLEAdvertising* advertising =
+        NimBLEDevice::getAdvertising();
 
 
     advertising->addServiceUUID(
@@ -536,10 +695,11 @@ void setupBLE() {
     );
 
 
-    advertising->setScanResponse(true);
+    advertising->setName("Codex-Usage-Monitor");
+    advertising->enableScanResponse(true);
+    advertising->setPreferredParams(24, 40);
 
-
-    BLEDevice::startAdvertising();
+    advertising->start();
 
 
     Serial.println(
@@ -628,16 +788,8 @@ void loop() {
         !deviceConnected &&
         millis() - disconnectedAtMs >= ADVERTISING_RESTART_DELAY_MS) {
 
-        // Rebooting after several connections that never reach a valid GATT
-        // write recovers a wedged BLE host without requiring a power cycle.
-        if (failedConnectionCount >= MAX_FAILED_CONNECTIONS) {
-            Serial.println("BLE repeatedly failed; restarting ESP32");
-            delay(100);
-            ESP.restart();
-        }
-
         advertisingRestartPending = false;
-        BLEDevice::startAdvertising();
+        NimBLEDevice::getAdvertising()->start();
         Serial.println("BLE advertising restarted");
     }
 

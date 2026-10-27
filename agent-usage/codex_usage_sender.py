@@ -12,11 +12,12 @@ from pathlib import Path
 
 from bleak.exc import BleakError
 
-from ble_sender import send_usage
+from ble_sender import UsageBleClient
 
 
 CODEX_SESSIONS = Path.home() / ".codex" / "sessions"
 WEEK_MINUTES = 7 * 24 * 60
+BLE_RETRY_SECONDS = 15
 
 
 @dataclass(frozen=True)
@@ -171,6 +172,7 @@ async def run_once(
     cursor_timeout: float,
     cursor_limit_cents: int | None,
     codexbar_bin: str | None,
+    ble_client: UsageBleClient | None,
 ) -> None:
     codex_remaining: int | None = None
     cursor_usage: CursorUsage | None = None
@@ -206,7 +208,9 @@ async def run_once(
         raise RuntimeError("No usage data could be collected")
 
     if not dry_run:
-        await send_usage(
+        if ble_client is None:
+            raise RuntimeError("BLE client was not initialized")
+        await ble_client.send_usage(
             codex_remaining,
             cursor_usage.used_cents if cursor_usage else None,
             cursor_usage.limit_cents if cursor_usage else None,
@@ -220,23 +224,44 @@ async def run(
     cursor_limit_cents: int | None,
     codexbar_bin: str | None,
 ) -> None:
-    while True:
-        try:
-            await run_once(
-                dry_run,
-                cursor_timeout,
-                cursor_limit_cents,
-                codexbar_bin,
-            )
-        except (BleakError, RuntimeError, OSError, ValueError) as error:
-            detail = str(error) or repr(error)
-            print(f"Error [{type(error).__name__}]: {detail}")
+    ble_client = None if dry_run else UsageBleClient()
+    try:
+        while True:
+            update_succeeded = False
+            try:
+                await run_once(
+                    dry_run,
+                    cursor_timeout,
+                    cursor_limit_cents,
+                    codexbar_bin,
+                    ble_client,
+                )
+                update_succeeded = True
+            except (BleakError, RuntimeError, OSError, ValueError) as error:
+                detail = str(error) or repr(error)
+                print(f"Error [{type(error).__name__}]: {detail}")
 
-        if interval is None:
-            return
+            if interval is None:
+                return
 
-        print(f"Next update in {interval} seconds")
-        await asyncio.sleep(interval)
+            if update_succeeded:
+                connection_note = (
+                    " (BLE stays connected)"
+                    if ble_client is not None and ble_client.is_connected
+                    else ""
+                )
+                print(f"Next update in {interval} seconds{connection_note}")
+                await asyncio.sleep(interval)
+            else:
+                retry_delay = min(BLE_RETRY_SECONDS, interval)
+                print(
+                    f"Update failed; retrying in {retry_delay} seconds "
+                    "(BLE is not connected)"
+                )
+                await asyncio.sleep(retry_delay)
+    finally:
+        if ble_client is not None:
+            await ble_client.close()
 
 
 def main() -> None:

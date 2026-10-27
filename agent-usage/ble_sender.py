@@ -8,8 +8,10 @@ from bleak.exc import BleakError
 
 
 DEVICE_NAME = "Codex-Usage-Monitor"
+SERVICE_UUID = "12345678-1234-1234-1234-123456789abc"
 CHARACTERISTIC_UUID = "87654321-4321-4321-4321-cba987654321"
 MAX_CURSOR_CENTS = 999_999
+CONNECT_ATTEMPTS = 3
 
 
 def _validate_optional_value(name: str, value: int | None, maximum: int) -> None:
@@ -41,60 +43,142 @@ def encode_usage_payload(
     return payload
 
 
-async def send_usage(
-    codex_percentage: int | None,
-    cursor_used_cents: int | None,
-    cursor_limit_cents: int | None,
-) -> None:
-    payload = encode_usage_payload(
-        codex_percentage,
-        cursor_used_cents,
-        cursor_limit_cents,
-    )
+class UsageBleClient:
+    """Keep one BLE/GATT connection alive across periodic usage updates."""
 
-    for attempt in range(1, 4):
-        print(f"Scanning for {DEVICE_NAME} (attempt {attempt}/3)...")
-        device = await BleakScanner.find_device_by_name(DEVICE_NAME, timeout=10.0)
+    def __init__(self) -> None:
+        self._client: BleakClient | None = None
 
-        if device is None:
-            print(f"Attempt {attempt} failed: device not found")
-            if attempt == 3:
-                raise RuntimeError(
-                    f"Could not find {DEVICE_NAME}. Check that the board is "
-                    "powered on and advertising."
-                )
-            await asyncio.sleep(2.0)
-            continue
+    @property
+    def is_connected(self) -> bool:
+        return self._client is not None and self._client.is_connected
 
-        print(f"Connecting to {device.address} (attempt {attempt}/3)...")
-        client = BleakClient(device, timeout=20.0)
+    async def _disconnect(self) -> None:
+        client, self._client = self._client, None
+        if client is None:
+            return
         try:
-            async with client:
-                print("Connected; GATT services discovered")
+            # Call disconnect even when BlueZ already reports false. A timed
+            # out connection can still have a half-open D-Bus device object
+            # that must be cleaned up before the next attempt.
+            await client.disconnect()
+        except (BleakError, OSError, RuntimeError, TimeoutError):
+            pass
+
+    async def close(self) -> None:
+        await self._disconnect()
+
+    async def _connect(self) -> BleakClient:
+        if self.is_connected:
+            return self._client  # type: ignore[return-value]
+
+        # Discard any stale BlueZ client before starting a fresh scan.
+        await self._disconnect()
+
+        for attempt in range(1, CONNECT_ATTEMPTS + 1):
+            print(
+                f"Scanning for {DEVICE_NAME} "
+                f"(attempt {attempt}/{CONNECT_ATTEMPTS})..."
+            )
+            device = await BleakScanner.find_device_by_name(
+                DEVICE_NAME,
+                timeout=10.0,
+            )
+
+            if device is None:
+                print(f"Attempt {attempt} failed: device not found")
+                if attempt == CONNECT_ATTEMPTS:
+                    raise RuntimeError(
+                        f"Could not find {DEVICE_NAME}. Check that the board is "
+                        "powered on and advertising."
+                    )
+                await asyncio.sleep(2.0)
+                continue
+
+            print(
+                f"Connecting to {device.address} "
+                f"(attempt {attempt}/{CONNECT_ATTEMPTS})..."
+            )
+            client = BleakClient(
+                device,
+                timeout=20.0,
+                services=[SERVICE_UUID],
+            )
+            try:
+                await client.connect()
+            except (BleakError, RuntimeError, TimeoutError) as error:
+                detail = str(error) or repr(error)
+                print(
+                    f"Attempt {attempt} failed "
+                    f"[{type(error).__name__}]: {detail}"
+                )
+                try:
+                    await client.disconnect()
+                except (BleakError, OSError, RuntimeError, TimeoutError):
+                    pass
+                if attempt == CONNECT_ATTEMPTS:
+                    raise
+                await asyncio.sleep(4.0)
+                continue
+
+            self._client = client
+            print("Connected; GATT services discovered; keeping connection open")
+            return client
+
+        raise RuntimeError(f"Could not connect to {DEVICE_NAME}")
+
+    async def send_usage(
+        self,
+        codex_percentage: int | None,
+        cursor_used_cents: int | None,
+        cursor_limit_cents: int | None,
+    ) -> None:
+        payload = encode_usage_payload(
+            codex_percentage,
+            cursor_used_cents,
+            cursor_limit_cents,
+        )
+
+        # A connection can disappear while the process sleeps. Retry the write
+        # once with a fresh connection when that happens.
+        for write_attempt in range(1, 3):
+            client = await self._connect()
+            try:
                 print(f"Writing usage payload: {payload.decode('ascii')}")
                 await client.write_gatt_char(
                     CHARACTERISTIC_UUID,
                     payload,
                     response=True,
                 )
-            break
-        except (BleakError, RuntimeError, TimeoutError) as error:
-            detail = str(error) or repr(error)
-            print(f"Attempt {attempt} failed [{type(error).__name__}]: {detail}")
+                print("Sent usage successfully; BLE connection remains open")
+                return
+            except (BleakError, RuntimeError, TimeoutError) as error:
+                detail = str(error) or repr(error)
+                print(
+                    "BLE write failed "
+                    f"[{type(error).__name__}]: {detail}"
+                )
+                await self._disconnect()
+                if write_attempt == 2:
+                    raise
+                print("Reconnecting before retrying the write...")
 
-            # A timed-out BlueZ connection can remain half-open briefly.  Make
-            # a best-effort disconnect before scanning and trying again.
-            if client.is_connected:
-                try:
-                    await client.disconnect()
-                except (BleakError, OSError):
-                    pass
 
-            if attempt == 3:
-                raise
-            await asyncio.sleep(4.0)
-
-    print("Sent usage successfully")
+async def send_usage(
+    codex_percentage: int | None,
+    cursor_used_cents: int | None,
+    cursor_limit_cents: int | None,
+) -> None:
+    """Send once and disconnect; periodic callers should reuse UsageBleClient."""
+    client = UsageBleClient()
+    try:
+        await client.send_usage(
+            codex_percentage,
+            cursor_used_cents,
+            cursor_limit_cents,
+        )
+    finally:
+        await client.close()
 
 
 async def send_percentage(percentage: int) -> None:
